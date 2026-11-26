@@ -1,0 +1,10 @@
+.env*
+!.env.example
+!.env.models.example
+**/__pycache__/
+**/node_modules/
+**/dist/
+**/.venv/
+**/.data/
+*.sqlite3*
+.DS_Store

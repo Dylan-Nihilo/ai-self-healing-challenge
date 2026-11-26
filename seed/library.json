@@ -1,0 +1,8 @@
+{
+  "documents": [
+    {"id": "getting-started", "title": "资料工作站使用指南", "file": "使用指南.md"},
+    {"id": "archive-policy", "title": "归档与保存约定", "file": "归档约定.md"},
+    {"id": "release-notes", "title": "本期项目交付记录", "file": "交付记录.md"}
+  ],
+  "search_probe": {"query": "安全保存", "document_id": "archive-policy"}
+}
