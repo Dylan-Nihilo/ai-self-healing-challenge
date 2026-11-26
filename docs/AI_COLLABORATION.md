@@ -1,6 +1,12 @@
 # AI 协作记录
 
-记录如何使用 Claude/Codex 开发、一次重要判断或纠错、验证方法，以及你亲自检查了哪些结果。不要粘贴未脱敏的私人对话或凭据。
+## 1. 工具、模型与协作分工
+
+我（候选人）使用 Codex 开发，由 Codex 编写并落地 solution 代码；另一会话 DeepSeek Harness 提供架构评审、故障诊断和外层真实环境验证，我负责转递结果并裁决分歧。Codex 会话的精确底层模型版本没有可核验的运行元数据，因此不猜测具体型号；协作方以 DeepSeek Harness 标识参与，其精确版本亦未核验。线上修复 agent 使用 `deepseek-chat`，与开发助手的底层模型是不同概念。
+
+模型选择基于外层实测而非偏好：`api.deepseek.com` 在宿主机与 runner 容器内均曾返回 HTTP 401，证明端点可达但当时需配置凭据；配置真实 key 后又取得合法 JSON 响应。`api.anthropic.com` 宿主直连返回 403（Cloudflare 地区限制）、容器内 SSL EOF；`api.openai.com` 直连与代理均不可达。这些是本次环境当时的结果，不代表服务在其他环境的普遍可用性。
+
+## 2. 实现、分工与验证记录
 
 ## 2026-11-26：Codex 与 DeepSeek Harness 协作接入模型规划
 
@@ -23,3 +29,47 @@ Harness 经用户转递报告：真实容器 mixed 修复 21 次调用、4.1 秒
 Harness 指出 phase0 与剧本重复读取，建议 prompt 复用 observed_facts、snapshot_details。
 Codex 核对发现解析器也强制重复读取，因此同步允许本轮 facts 满足 snapshots、snapshot verification、settings、storage、jobs、manual listing 的前置条件；保留恢复前读取 catalog 当前哈希、实际 read_manual 和修改步骤顺序约束。
 Codex 离线验证精简 A/B/C 计划分别为 8/4/2 个模型步骤；移除 A 的 read_manual 会被拒绝。scope 检查再次 ok=true。真实精简计划的调用数与恢复效果待 Harness 复测，未提前宣称通过。
+
+## 3. 参数分类错误：模型输出正确剧本却被校验器拒绝
+
+2026-11-26，Harness 用真实 DeepSeek 做三场景首测：C 仅 backlog 的计划通过；A/B 的计划内容正确，却被 planner 拒绝，分别报告 `snapshot_id must be observed in this run's snapshots` 和 `export_directory must be an observed available directory`。
+
+A 的真实首测 plan 由 Harness 提供，序列如下（资源符号展示的是当时模型输出，不是修正后的接口）：
+
+```text
+list_manuals
+→ read_manual(document_id="workstation-v2")
+→ read_resource(resource="catalog")
+→ list_snapshots
+→ read_snapshot(snapshot_id="$snapshot_id")
+→ restore_catalog(snapshot_id="$snapshot_id", expected_sha256="$catalog_sha")
+→ rebuild_index(expected_catalog_sha="$restored_sha")
+→ read_resource(resource="settings")
+→ inspect_storage
+→ update_settings(expected_revision="$revision", export_directory="$storage_directory")
+→ reload_worker(expected_revision="$revision")
+→ read_resource(resource="jobs")
+→ retry_job
+→ run_self_check
+```
+
+模型主动选择了 `workstation-v2`，B 也没有恢复正常的 catalog；错误不在模型是否理解故障，而在接口分类。初版 prompt 允许把 snapshot_id/export_directory 写成运行时符号，校验器却立即要求 facts 中已有相应解析值；首次规划时该键不存在，于是正确方向的剧本也被拒绝。
+
+Harness 提出分类修正，Codex 核对后落地：时序符号用于模型无法预知、执行时才产生或更新的值，如坏目录哈希、恢复后哈希和新 revision；选择值是 facts 已经给出的候选，模型应选择真实 ID，如 snapshot_id、export_directory、document_id。phase0 提供全量候选与 snapshot_details，模型据此做选择，校验器负责验证来源。
+
+修正后真实模型 + 真实 Workstation 端到端结果为 A 14 步、B 7 步、C 3 步，全部四项全绿。让模型统一使用符号看似安全，实际会抽走模型对快照和目录的判断权，恰好丢掉题目最核心的考点「AI 自主选择」。这次纠错使模型决策与执行器安全校验的边界更清楚。
+
+## 4. 候选人亲自核验
+
+我（候选人本人）在浏览器 http://127.0.0.1:15192 完成了以下核验；以下是我亲自动手的结果，不是 AI 代做的验证：
+
+1. 亲眼观察到四项检查（资料读取、全文检索、资料归档、原有任务）由红色失败状态
+   变为绿色通过状态，页面显示「各项功能正常，持续自动自检」。
+2. 在页面点击「触发一次故障」，观察到系统重新进入恢复流程并自行修复回四项全绿。
+3. 下载了归档 ZIP 文件并打开，确认包内文档内容正常可读。
+
+## 5. 最终外层实测与证据边界
+
+2026-11-26，候选人转递 Harness 的优化后真实容器结果：mixed 为 15 次调用 / 4.1 秒，worker 单点为 7 次调用 / 4.1 秒，两轮四项全绿；worker 单点没有 restore_catalog/rebuild_index。与优化前 21 次和 10 次相比，分别减少约 29% 和 30%。这是第 2 节“待复测”之后收到的验收结果，而非当时提前作出的结论。
+
+真实 DeepSeek 独立 Workstation 场景为 A 全红 14 步 / 2.4 秒、B export+backlog 7 步 / 2.1 秒、C backlog 3 步 / 1.6 秒，均四项全绿。fixed 对照初次 13 次、二次 12 次，也均恢复。Codex 的替身模型验证只用于编排接线，不算真实模型能力证据；真实模型与容器数据来自 Harness 外层，浏览器和 ZIP 核验来自候选人本人，三者明确区分。
