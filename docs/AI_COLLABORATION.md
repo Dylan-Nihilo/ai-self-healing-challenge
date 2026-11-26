@@ -8,7 +8,7 @@
 
 ## 2. 实现、分工与验证记录
 
-## 2026-11-26：Codex 与 DeepSeek Harness 协作接入模型规划
+### 2026-11-26：Codex 与 DeepSeek Harness 协作接入模型规划
 
 用户负责转递双方结论；Codex 负责实现，DeepSeek Harness 负责架构评审和外层真实容器验证。
 Harness 报告 fixed 模式首次与 worker drill 均四项全绿，并提供真实 DeepSeek A/B/C 场景规划、校验、执行全通过的结果。

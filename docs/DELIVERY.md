@@ -89,7 +89,7 @@ docker compose run --rm --no-deps tests
 docker run --rm -v "${PWD}:/candidate:ro" -w /candidate python:3.11-slim-bookworm python assessment/check_scope.py --candidate /candidate
 ```
 
-scope 检查实测输出为 `{"ok": true, "problems": []}`。上面的固定测试命令是复现入口，不将未附结果的测试描述为已通过。
+实测结果：固定测试套件 16 个测试全部通过（`Ran 16 tests in 0.738s` / `OK`）；scope 检查输出 `{"ok": true, "problems": []}`；前端 `npm run build`（`tsc --noEmit && vite build`）通过。
 
 ## 7. 实现说明与取舍
 
