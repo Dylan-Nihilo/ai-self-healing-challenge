@@ -97,8 +97,8 @@ def _validate(step: Step, args: dict[str, Any], report: ExecutionReport) -> None
     elif step.tool == "retry_job" and args.get("job_id") not in report.facts.get("job_ids", []):
         raise ValueError("retry_job job_id was not observed as pending in this run")
 
-def execute(steps: Sequence[Step], tools: ToolClient, *, deadline: float, budget: int = 32, initial_facts: dict[str, Any] | None = None) -> ExecutionReport:
-    report = ExecutionReport(facts=dict(initial_facts or {}))
+def execute(steps: Sequence[Step], tools: ToolClient, *, deadline: float, budget: int = 32, initial_facts: dict[str, Any] | None = None, initial_evidence: Sequence[ToolEvidence] = (), initial_calls: int = 0) -> ExecutionReport:
+    report = ExecutionReport(evidence=list(initial_evidence), facts=dict(initial_facts or {}), calls_used=initial_calls)
     guards: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
     for index, step in enumerate(steps):
         args: dict[str, Any] = dict(step.args)
