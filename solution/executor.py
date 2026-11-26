@@ -46,17 +46,20 @@ class ExecutionReport:
 def failure_severity(code: str) -> str:
     return "step" if code in STEP_CODES else "fatal"
 
-def _facts(report: ExecutionReport, tool: str, data: Any) -> None:
+def _facts(report: ExecutionReport, tool: str, args: dict[str, Any], data: Any) -> None:
     if not isinstance(data, dict):
         return
     if tool == "read_resource":
-        resource = data.get("resource")
+        resource = args.get("resource")
         if (resource == "catalog" or "sha256" in data) and isinstance(data.get("sha256"), str):
             report.facts["catalog_sha"] = data["sha256"]
         if resource == "settings" and isinstance(data.get("revision"), int):
             report.facts["revision"] = data["revision"]
+        if resource == "loaded_settings" and isinstance(data.get("revision"), int):
+            report.facts["loaded_revision"] = data["revision"]
         if resource == "jobs" and isinstance(data.get("jobs"), list):
-            report.facts["job_ids"] = [j["id"] for j in data["jobs"] if isinstance(j, dict) and j.get("state") != "done" and isinstance(j.get("id"), str)]
+            report.facts["jobs"] = [{"id": j["id"], "state": j.get("state")} for j in data["jobs"] if isinstance(j, dict) and isinstance(j.get("id"), str)]
+            report.facts["job_ids"] = [j["id"] for j in report.facts["jobs"] if j["state"] != "done"]
     elif tool == "restore_catalog":
         for key in ("sha256", "catalog_sha"):
             if isinstance(data.get(key), str):
@@ -64,6 +67,8 @@ def _facts(report: ExecutionReport, tool: str, data: Any) -> None:
                 break
     elif tool == "update_settings" and isinstance(data.get("revision"), int):
         report.facts["revision"] = data["revision"]
+    elif tool == "inspect_storage" and isinstance(data.get("directories"), list):
+        report.facts["storage_directories"] = data["directories"]
 
 def _resolve(value: Any, report: ExecutionReport) -> Any:
     if isinstance(value, str) and value.startswith("$"):
@@ -89,6 +94,8 @@ def _validate(step: Step, args: dict[str, Any], report: ExecutionReport) -> None
         raise ValueError("rebuild_index requires latest restored_sha")
     elif step.tool in {"update_settings", "reload_worker"} and args.get("expected_revision") != report.facts.get("revision"):
         raise ValueError(f"{step.tool} requires latest revision")
+    elif step.tool == "retry_job" and args.get("job_id") not in report.facts.get("job_ids", []):
+        raise ValueError("retry_job job_id was not observed as pending in this run")
 
 def execute(steps: Sequence[Step], tools: ToolClient, *, deadline: float, budget: int = 32, initial_facts: dict[str, Any] | None = None) -> ExecutionReport:
     report = ExecutionReport(facts=dict(initial_facts or {}))
@@ -113,7 +120,7 @@ def execute(steps: Sequence[Step], tools: ToolClient, *, deadline: float, budget
             report.calls_used += 1
             data = tools.call(step.tool, **args).get("data")
             report.evidence.append(ToolEvidence(index, step.tool, args, True, data=data))
-            _facts(report, step.tool, data)
+            _facts(report, step.tool, args, data)
             if step.tool == "run_self_check":
                 report.facts["self_checks"] = report.facts.get("self_checks", 0) + 1
                 if report.facts["self_checks"] >= MAX_SELF_CHECKS:
@@ -143,3 +150,22 @@ def build_catalog_script(snapshot_id: str) -> list[Step]:
         Step("rebuild_index", {"expected_catalog_sha": "$restored_sha"}),
         Step("run_self_check"),
     ]
+
+def build_mixed_script(snapshot_id: str, export_directory: str) -> list[Step]:
+    return [
+        Step("read_resource", {"resource": "catalog"}),
+        Step("list_snapshots"),
+        Step("read_snapshot", {"snapshot_id": snapshot_id}),
+        Step("restore_catalog", {"snapshot_id": snapshot_id, "expected_sha256": "$catalog_sha"}),
+        Step("rebuild_index", {"expected_catalog_sha": "$restored_sha"}),
+        Step("read_resource", {"resource": "settings"}),
+        Step("read_resource", {"resource": "loaded_settings"}),
+        Step("inspect_storage"),
+        Step("update_settings", {"expected_revision": "$revision", "export_directory": export_directory}),
+        Step("reload_worker", {"expected_revision": "$revision"}),
+        Step("read_resource", {"resource": "jobs"}),
+    ]
+
+def build_retry_script(job_ids: Sequence[str]) -> list[Step]:
+    """Create one independent retry call per pending job discovered in phase one."""
+    return [Step("retry_job", {"job_id": job_id}) for job_id in job_ids]
