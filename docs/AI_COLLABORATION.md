@@ -73,3 +73,67 @@ Harness 提出分类修正，Codex 核对后落地：时序符号用于模型无
 2026-11-26，候选人转递 Harness 的优化后真实容器结果：mixed 为 15 次调用 / 4.1 秒，worker 单点为 7 次调用 / 4.1 秒，两轮四项全绿；worker 单点没有 restore_catalog/rebuild_index。与优化前 21 次和 10 次相比，分别减少约 29% 和 30%。这是第 2 节“待复测”之后收到的验收结果，而非当时提前作出的结论。
 
 真实 DeepSeek 独立 Workstation 场景为 A 全红 14 步 / 2.4 秒、B export+backlog 7 步 / 2.1 秒、C backlog 3 步 / 1.6 秒，均四项全绿。fixed 对照初次 13 次、二次 12 次，也均恢复。Codex 的替身模型验证只用于编排接线，不算真实模型能力证据；真实模型与容器数据来自 Harness 外层，浏览器和 ZIP 核验来自候选人本人，三者明确区分。
+
+## 6. 测试覆盖盲区：search 单点故障暴露的校验不一致
+
+### 现象
+
+PR 提交后，候选人在浏览器点击「触发一次故障」做最后确认，随机抽到 `search` 单点注入。结果是 3 / 4 项通过、全文检索为红，右侧「自主修复」显示「等待补充处理」（`blocked`），需要人工点「重新运行修复模块」。
+
+该轮 summary 记录了真实经过：
+
+```
+[模型判断] catalog 本身可读且完整，仅检索索引损坏；此前 rebuild_index 失败是因为
+缺少 latest restored_sha 参数，而非索引无法重建。
+Initially failed=search.
+Steps=read_resource(ok); rebuild_index(failed); read_resource(ok); rebuild_index(failed);
+run_self_check(ok).
+Issues=rebuild_index:invalid_tool_arguments ×2
+```
+
+模型判断正确，重规划也按预期触发并重新读取了 catalog，但两次执行都被同一处校验拒绝。
+
+### 根因：三处对同一参数的约定不一致
+
+`inject()` 支持 `catalog` / `search` / `worker` / `mixed` 四种注入。`search` 单点的特殊性在于 catalog 完好，因此本轮不存在 `restored_sha`（只有执行过 `restore_catalog` 才会产生）。
+
+- planner 的 prompt 规则 5 明确写了「若只有 search 损坏而 catalog 通过，先读取 catalog，再用 `$catalog_sha` 重建」，允许这一做法；
+- planner 的参数校验放行 `$catalog_sha` 与 `$restored_sha` 两者；
+- executor 的 `_validate` 却硬性要求 `expected_catalog_sha == facts["restored_sha"]`。
+
+于是模型按规则产出的合法剧本，在最后一道校验被判定为 `invalid_tool_arguments`。这条路径只有 `search` 单点会走到。
+
+### 为什么前面没发现
+
+此前所有验证都覆盖 `catalog`、`worker`、`mixed` 以及 A/B/C 三场景，唯独没有单独注入 `search`。四类故障里测了三类，剩下那一类恰好是唯一会触发该分支的。这不是运气问题，是测试矩阵少了一格。
+
+### 修复
+
+`executor.py` 的 `_validate` 改 5 行：
+
+```python
+elif step.tool == "rebuild_index":
+    # 恢复目录后必须用恢复后的 sha；仅索引损坏（catalog 完好）时用当前目录 sha
+    expected_sha = report.facts.get("restored_sha") or report.facts.get("catalog_sha")
+    if args.get("expected_catalog_sha") != expected_sha:
+        raise ValueError("rebuild_index requires the latest catalog sha")
+```
+
+语义是：刚恢复过目录（存在 `restored_sha`）时仍必须用恢复后的哈希，避免用过期值重建索引；只有不存在恢复结果时才回退到当前 `catalog_sha`。保留了对过期值的拦截，只补上了缺失的合法路径。
+
+### 修复后验证
+
+真实容器逐一注入三类故障，全部自主恢复：
+
+| 注入类型 | 调用数 | 耗时 | 工具序列 | 结果 |
+|---|---:|---:|---|---|
+| `search` 单点（原失败场景） | 3 | 2.1s | `read_resource(catalog)` → `rebuild_index` → `run_self_check` | 四项全绿 |
+| `catalog` 单点 | 14 | 4.1s | 快照链 + worker 链 + retry | 四项全绿 |
+| `mixed` 全坏 | 15 | 4.1s | 手册 + 快照链 + worker 链 + retry | 四项全绿 |
+
+`search` 场景从「3 次调用全部失败、判定 blocked」变为「3 次调用全绿」，`catalog` 与 `mixed` 未受该修改影响。
+
+### 这次暴露的价值
+
+它说明覆盖不足比功能缺陷更危险：缺陷本身只有 5 行，但它藏在一个从未被单独走到的分支里。也说明「模型判断正确、执行器拒绝」这类不一致，往往发生在多个模块各自守约、但约定彼此矛盾的位置 —— 与第 3 节的参数分类错误属于同一类问题，只是那次发生在 planner 与 prompt 之间，这次发生在 executor 与 planner 之间。
+
