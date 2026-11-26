@@ -90,8 +90,11 @@ def _validate(step: Step, args: dict[str, Any], report: ExecutionReport) -> None
             raise ValueError("snapshot_id was not observed in this run")
         if args.get("expected_sha256") != report.facts.get("catalog_sha"):
             raise ValueError("restore_catalog requires latest catalog_sha")
-    elif step.tool == "rebuild_index" and args.get("expected_catalog_sha") != report.facts.get("restored_sha"):
-        raise ValueError("rebuild_index requires latest restored_sha")
+    elif step.tool == "rebuild_index":
+        # 恢复目录后必须用恢复后的 sha；仅索引损坏（catalog 完好）时用当前目录 sha。
+        expected_sha = report.facts.get("restored_sha") or report.facts.get("catalog_sha")
+        if args.get("expected_catalog_sha") != expected_sha:
+            raise ValueError("rebuild_index requires the latest catalog sha")
     elif step.tool in {"update_settings", "reload_worker"} and args.get("expected_revision") != report.facts.get("revision"):
         raise ValueError(f"{step.tool} requires latest revision")
     elif step.tool == "retry_job" and args.get("job_id") not in report.facts.get("job_ids", []):
