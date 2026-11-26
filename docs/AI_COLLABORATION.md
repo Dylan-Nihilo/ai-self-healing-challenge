@@ -16,3 +16,10 @@ Codex 亲自验证：模块导入成功；assessment/check_scope.py 输出 ok=tr
 用替身模型（不是 DeepSeek）加真实 Workstation 和 process_next 后台线程验证编排：21 次工具调用，outcome=changed，catalog/search/export/backlog 均通过，无 fixed 降级。
 首次宿主测试因默认 GBK 读取中文 seed 失败，使用 Python -X utf8 后通过，没有修改 core。
 本阶段真实 DeepSeek 和 /api/repair 容器验收由 Harness 在外层执行；不得把替身模型验证描述为真实模型验证。
+
+### 模型模式外层验收与重复读取优化
+
+Harness 经用户转递报告：真实容器 mixed 修复 21 次调用、4.1 秒、四项全绿；worker drill 10 次调用、4.1 秒、四项全绿，且 worker-only 计划没有 restore_catalog/rebuild_index。两轮模型判断均出现在 summary 开头，revision 更新与 reload 链正确。
+Harness 指出 phase0 与剧本重复读取，建议 prompt 复用 observed_facts、snapshot_details。
+Codex 核对发现解析器也强制重复读取，因此同步允许本轮 facts 满足 snapshots、snapshot verification、settings、storage、jobs、manual listing 的前置条件；保留恢复前读取 catalog 当前哈希、实际 read_manual 和修改步骤顺序约束。
+Codex 离线验证精简 A/B/C 计划分别为 8/4/2 个模型步骤；移除 A 的 read_manual 会被拒绝。scope 检查再次 ok=true。真实精简计划的调用数与恢复效果待 Harness 复测，未提前宣称通过。

@@ -73,18 +73,19 @@ SYSTEM_PROMPT = r'''你是“万象硅芯 · AI 自愈工作站”的修复规�
 强制决策与顺序规则：
 1. 只能使用上面的 12 个工具。
 2. 仅处理当前失败项，不要修复已经通过的功能。
-3. 若 catalog 失败，先 read_resource(resource="catalog")；再 list_snapshots，按版本和 read_snapshot 内容选择 schema_version=2 且 documents 至少 3 份的快照；然后 restore_catalog，最后 rebuild_index。
+3. 若 catalog 失败，先 read_resource(resource="catalog") 取得当前 sha；按版本和快照内容选择 schema_version=2 且 documents 至少 3 份的快照，然后 restore_catalog，最后 rebuild_index。若 observed_facts.snapshot_details 已提供各快照的 schema_version 与 documents 数量，直接据此选择，无需再次 read_snapshot；只有 snapshot_details 缺失或信息不足时才调用 read_snapshot。已有 snapshots 时不重复 list_snapshots。
 4. restore_catalog 的 snapshot_id 必须是本轮真实观察到的 id；expected_sha256 必须写 "$catalog_sha"。禁止编造运行时 id 或哈希。
 5. catalog 损坏时 rebuild_index 必须在 restore_catalog 之后，expected_catalog_sha 写 "$restored_sha"。若只有 search 损坏而 catalog 通过，先读取 catalog，再用 "$catalog_sha" 重建，不要恢复正常目录。
-6. 若 export 失败，读取 read_resource(resource="settings") 并 inspect_storage；export_directory 必须取自 available=true 目录。先 update_settings(expected_revision="$revision")，再 reload_worker(expected_revision="$revision")，使用更新后的 revision。
-7. backlog 若失败，应在归档能力恢复后读取 jobs 并对所有非 done 任务逐个 retry_job。不得猜测 job id。
+6. 若 export 失败，使用已有 settings 和 storage_directories（缺失时才读取 settings 并 inspect_storage）；export_directory 必须取自 available=true 目录。先 update_settings(expected_revision="$revision")，再 reload_worker(expected_revision="$revision")，使用更新后的 revision。
+7. backlog 若失败，应在归档能力恢复后对所有非 done 任务逐个 retry_job；已有 jobs/job_ids 时直接使用，不必再次读取 jobs。不得猜测 job id。
 8. snapshot_id 和 export_directory 是模型必须从 observed_facts 中挑选的真实选择值，不是时序符号。snapshot_id 必须满足 2.x、schema_version=2、documents 至少 3 份；export_directory 必须 available=true。不得编造或用占位符替代。
 9. 符号 sha/revision 参数必须按上述符号传递，不得写数字或旧值。
 10. 最后通常调用 run_self_check；不要安排超过 2 次。
 11. plan 最多 15 个步骤。剩余工具预算 <<CALLS_REMAINING>> 次，剩余时间约 <<SECONDS_REMAINING>> 秒；计划必须在预算内。预算紧张时优先修复影响面最大的失败项，省略次要调查。
-12. A 场景（catalog/search/export/backlog 均失败）必须先查看维护手册：list_manuals 后读取适用于 system_version 的手册。document_id 必须取自 observed_facts.manuals 的真实 id；缺少手册目录时先由调用方采集，不得编造。不要读取或照搬不匹配的旧手册。
-13. C 场景（仅 backlog 失败）只需读取 jobs、retry 每个非 done 任务并最终自检；不要触碰 catalog 或 worker。
+12. A 场景（catalog/search/export/backlog 均失败）必须在修复前 read_manual 读取适用于 system_version 的手册；已有 manuals 时无需重复 list_manuals。document_id 必须取自 observed_facts.manuals 的真实 id；缺少手册目录时先由调用方采集，不得编造。不要读取或照搬不匹配的旧手册。
+13. C 场景（仅 backlog 失败）只需使用已有 jobs/job_ids（缺失时读取 jobs）、retry 每个非 done 任务并最终自检；不要触碰 catalog 或 worker。
 14. 输出必须是 JSON object 格式。字段 diagnosis 应指出根因推断，不要只复述错误；if_fail 应写出失败后的下一种具体调查/恢复方式。
+15. observed_facts 中已经包含的读取结果不需要重复调用相同工具，直接使用事实值作为参数或判断依据。catalog 的当前 sha 仍须在恢复前读取；遇到 resource_changed/revision_conflict 时必须重新读取冲突资源，不能复用过期值。
 '''
 
 
@@ -214,7 +215,7 @@ def _validate_args(tool: str, args: Any, index: int, facts: dict[str, Any]) -> d
     return args
 
 
-def _validate_order(steps: list[Step]) -> None:
+def _validate_order(steps: list[Step], facts: dict[str, Any]) -> None:
     tools = [step.tool for step in steps]
     positions: dict[str, list[int]] = {}
     for index, name in enumerate(tools):
@@ -238,20 +239,27 @@ def _validate_order(steps: list[Step]) -> None:
     if "restore_catalog" in positions:
         if resource_reads.get("catalog", len(steps)) > min(positions["restore_catalog"]):
             raise PlannerError("read_resource(catalog) must precede restore_catalog")
-        require_before("list_snapshots", "restore_catalog", "snapshot listing")
-        require_before("read_snapshot", "restore_catalog", "snapshot verification")
+        if not facts.get("snapshots"):
+            require_before("list_snapshots", "restore_catalog", "snapshot listing")
+        for step in steps:
+            if step.tool == "restore_catalog":
+                verified = any(isinstance(d, dict) and d.get("id") == step.args["snapshot_id"]
+                               and d.get("schema_version") == 2 and isinstance(d.get("documents"), int)
+                               and d["documents"] >= 3 for d in facts.get("snapshot_details", []))
+                if not verified:
+                    require_before("read_snapshot", "restore_catalog", "snapshot verification")
     if "rebuild_index" in positions and "restore_catalog" not in positions:
         if resource_reads.get("catalog", len(steps)) > min(positions["rebuild_index"]):
             raise PlannerError("read_resource(catalog) must precede rebuild_index")
     for target in ("update_settings",):
         if target in positions:
-            if resource_reads.get("settings", len(steps)) > min(positions[target]):
+            if not (isinstance(facts.get("settings"), dict) and isinstance(facts.get("revision"), int)) and resource_reads.get("settings", len(steps)) > min(positions[target]):
                 raise PlannerError(f"read_resource(settings) must precede {target}")
-            if "inspect_storage" not in positions or min(positions["inspect_storage"]) > min(positions[target]):
+            if not facts.get("storage_directories") and ("inspect_storage" not in positions or min(positions["inspect_storage"]) > min(positions[target])):
                 raise PlannerError("inspect_storage must precede update_settings")
-    if "retry_job" in positions and resource_reads.get("jobs", len(steps)) > min(positions["retry_job"]):
+    if "retry_job" in positions and not isinstance(facts.get("job_ids"), list) and resource_reads.get("jobs", len(steps)) > min(positions["retry_job"]):
         raise PlannerError("read_resource(jobs) must precede retry_job")
-    if "read_manual" in positions:
+    if "read_manual" in positions and not facts.get("manuals"):
         require_before("list_manuals", "read_manual", "list_manuals")
     if "retry_job" in positions:
         retry_at = min(positions["retry_job"])
@@ -264,7 +272,7 @@ def _validate_order(steps: list[Step]) -> None:
         raise PlannerError("plan may contain at most one run_self_check")
 
 
-def _covered_failures(steps: list[Step], failed: set[str]) -> set[str]:
+def _covered_failures(steps: list[Step], failed: set[str], facts: dict[str, Any]) -> set[str]:
     names = {step.tool for step in steps}
     covered: set[str] = set()
     if "catalog" in failed and "restore_catalog" in names and "rebuild_index" in names:
@@ -273,7 +281,8 @@ def _covered_failures(steps: list[Step], failed: set[str]) -> set[str]:
         covered.add("search")
     if "export" in failed and {"update_settings", "reload_worker"}.issubset(names):
         covered.add("export")
-    if "backlog" in failed and "read_resource" in names and any(s.tool == "read_resource" and s.args.get("resource") == "jobs" for s in steps) and "retry_job" in names:
+    jobs_known = isinstance(facts.get("job_ids"), list) or any(s.tool == "read_resource" and s.args.get("resource") == "jobs" for s in steps)
+    if "backlog" in failed and jobs_known and "retry_job" in names:
         covered.add("backlog")
     return covered
 
@@ -335,7 +344,7 @@ def parse_plan(
         raise PlannerError("plan expanded to no executable steps")
     if len(steps) > max_steps:
         raise PlannerError(f"expanded plan exceeds {max_steps} steps")
-    _validate_order(steps)
+    _validate_order(steps, facts or {})
 
     checks = getattr(context, "checks", [])
     passed = {str(check.get("id")) for check in checks if isinstance(check, dict) and check.get("ok")}
@@ -348,14 +357,14 @@ def parse_plan(
     unknown_failed = failed - {"catalog", "search", "export", "backlog"}
     if unknown_failed:
         raise PlannerError(f"unknown failed checks: {sorted(unknown_failed)}")
-    missing = failed - _covered_failures(steps, failed)
+    missing = failed - _covered_failures(steps, failed, facts or {})
     if missing:
         raise PlannerError(f"plan does not address failed checks: {sorted(missing)}")
     if {"catalog", "search", "export", "backlog"}.issubset(failed):
-        if not {"list_manuals", "read_manual"}.issubset(names):
-            raise PlannerError("all-failed plan must list and read an applicable recovery manual")
+        if "read_manual" not in names or (not (facts or {}).get("manuals") and "list_manuals" not in names):
+            raise PlannerError("all-failed plan must read an applicable recovery manual using observed manuals")
         read_at = next(i for i, step in enumerate(steps) if step.tool == "read_manual")
-        list_at = next(i for i, step in enumerate(steps) if step.tool == "list_manuals")
+        list_at = next((i for i, step in enumerate(steps) if step.tool == "list_manuals"), -1)
         writes = {"restore_catalog", "rebuild_index", "update_settings", "reload_worker", "retry_job"}
         if list_at > read_at or any(step.tool in writes for step in steps[:read_at]):
             raise PlannerError("manual investigation must precede repair operations")
