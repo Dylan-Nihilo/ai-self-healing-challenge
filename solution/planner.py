@@ -38,6 +38,15 @@ SYSTEM_PROMPT = r'''你是“万象硅芯 · AI 自愈工作站”的修复规�
 - 旧版手册中关于「固定目录名称」的描述可能不适用于当前版本，不要照搬。
 - 读取手册属于调查动作，消耗工具预算，通常一次足够，不要重复读取。
 
+【必须以本轮查到的资料为准】
+observed_facts 中可能包含以下真实资料，它们是调查阶段实际读取的结果，不是推测：
+- manual_content：手册原文（按 document_id 索引）。恢复流程、目录格式、配置写法的正确做法以它为准。
+  如果手册中的说明与你的经验或通用做法冲突，以手册为准；如果手册声明的适用版本与 system_version
+  不一致，或手册内容与当前故障明显矛盾，应在 diagnosis 中指出并给出你据此调整后的方案。
+- snapshot_content：各快照的 schema_version 与 documents 数量，用于判断哪份快照完整可用。
+- settings / storage_directories / jobs：当前真实配置与任务状态。
+你的修复计划必须建立在这些资料之上。如果某项关键资料缺失，应先安排读取，而不是凭经验假设。
+
 【失败信息与可能根因的对应】
 - catalog 报「资料目录无法解析」→ catalog.json 内容损坏，需从快照恢复并重建索引。
 - search 报「检索索引不可用」→ 索引表结构损坏，需 rebuild_index（依赖可读的 catalog）。
@@ -75,7 +84,11 @@ SYSTEM_PROMPT = r'''你是“万象硅芯 · AI 自愈工作站”的修复规�
 2. 仅处理当前失败项，不要修复已经通过的功能。
 3. 若 catalog 失败，先 read_resource(resource="catalog") 取得当前 sha；按版本和快照内容选择 schema_version=2 且 documents 至少 3 份的快照，然后 restore_catalog，最后 rebuild_index。若 observed_facts.snapshot_details 已提供各快照的 schema_version 与 documents 数量，直接据此选择，无需再次 read_snapshot；只有 snapshot_details 缺失或信息不足时才调用 read_snapshot。已有 snapshots 时不重复 list_snapshots。
 4. restore_catalog 的 snapshot_id 必须是本轮真实观察到的 id；expected_sha256 必须写 "$catalog_sha"。禁止编造运行时 id 或哈希。
-5. catalog 损坏时 rebuild_index 必须在 restore_catalog 之后，expected_catalog_sha 写 "$restored_sha"。若只有 search 损坏而 catalog 通过，先读取 catalog，再用 "$catalog_sha" 重建，不要恢复正常目录。
+5. catalog 损坏时 rebuild_index 必须在 restore_catalog 之后，expected_catalog_sha 写 "$restored_sha"。
+   若 catalog 检查已通过（catalog 的 ok=true）而仅 search 失败：**绝对不要调用 restore_catalog**，
+   直接 read_resource(resource="catalog") 取得当前目录的 sha256，再调用
+   rebuild_index(expected_catalog_sha="$catalog_sha")。校验器会拒绝任何针对已通过项的写操作，
+   包括 restore_catalog，即使你已经把它排进了计划。
 6. 若 export 失败，使用已有 settings 和 storage_directories（缺失时才读取 settings 并 inspect_storage）；export_directory 必须取自 available=true 目录。先 update_settings(expected_revision="$revision")，再 reload_worker(expected_revision="$revision")，使用更新后的 revision。
 7. backlog 若失败，应在归档能力恢复后对所有非 done 任务逐个 retry_job；已有 jobs/job_ids 时直接使用，不必再次读取 jobs。不得猜测 job id。
 8. snapshot_id 和 export_directory 是模型必须从 observed_facts 中挑选的真实选择值，不是时序符号。snapshot_id 必须满足 2.x、schema_version=2、documents 至少 3 份；export_directory 必须 available=true。不得编造或用占位符替代。
@@ -87,6 +100,61 @@ SYSTEM_PROMPT = r'''你是“万象硅芯 · AI 自愈工作站”的修复规�
 14. 输出必须是 JSON object 格式。字段 diagnosis 应指出根因推断，不要只复述错误；if_fail 应写出失败后的下一种具体调查/恢复方式。
 15. observed_facts 中已经包含的读取结果不需要重复调用相同工具，直接使用事实值作为参数或判断依据。catalog 的当前 sha 仍须在恢复前读取；遇到 resource_changed/revision_conflict 时必须重新读取冲突资源，不能复用过期值。
 '''
+
+
+INVESTIGATION_PROMPT = r'''你是“万象硅芯 · AI 自愈工作站”的修复规划器，当前处于【调查阶段】。
+
+本阶段的目标不是修复，而是收集足够证据判断根因。修复计划会在下一阶段、基于你这一阶段
+真实读到的资料来制定。因此只做必要的读取，不要尝试任何写操作。
+
+只输出一个合法 JSON 对象，不要 Markdown、代码围栏或额外文字。JSON 必须且只能包含：
+{
+  "diagnosis": "初步判断：哪些功能失败，可能的方向",
+  "plan": [{"tool": "工具名", "args": {}, "why": "读这个是为了确认什么"}],
+  "expect": "调查完成后你预计能确定什么",
+  "if_fail": "某个调查工具失败时的替代方案"
+}
+
+当前运行上下文：
+- system_version: <<SYSTEM_VERSION>>
+- checks: <<CHECKS>>
+- previous_summary: <<PREVIOUS_SUMMARY>>
+- observed_facts: <<FACTS>>
+- calls_remaining: <<CALLS_REMAINING>>
+- seconds_remaining: <<SECONDS_REMAINING>>
+
+【本阶段只允许只读工具】
+- read_resource(resource)，resource ∈ catalog / settings / loaded_settings / jobs / logs
+- list_manuals()
+- read_manual(document_id)
+- list_snapshots()
+- read_snapshot(snapshot_id)
+- inspect_storage()
+
+禁止使用 restore_catalog、rebuild_index、update_settings、reload_worker、retry_job、
+run_self_check —— 这些属于修复阶段。
+
+【调查优先级】
+1. 若 catalog 或 search 失败：先 list_manuals，再 read_manual 读取与 system_version 匹配的手册。
+   正确的恢复流程写在手册里，且手册存在多个版本，必须选择匹配当前版本的那一份。
+2. 若 catalog 失败：读取 catalog 当前原文与 sha256；核对快照候选，用 read_snapshot 确认
+   每份快照的 schema_version 与 documents 数量。
+3. 若 export 失败：读取 settings，并 inspect_storage 确认真实可用目录。
+4. 若 backlog 失败：读取 jobs 确认未完成任务及其状态。
+
+【约束】
+1. 计划最多 6 步，只做必要读取。
+2. observed_facts 中已有的数据不要重复调用相同工具，直接使用事实值。
+3. document_id 必须来自 observed_facts.manuals 的真实 id，不得编造。
+4. snapshot_id 必须来自 observed_facts.snapshots 的真实 id，不得编造。
+5. 输出必须是合法 JSON object，适合 JSON response mode。
+'''
+
+
+INVESTIGATION_TOOLS = frozenset({
+    "read_resource", "list_manuals", "read_manual",
+    "list_snapshots", "read_snapshot", "inspect_storage",
+})
 
 
 TOOL_ARGUMENTS: dict[str, set[str]] = {
@@ -135,10 +203,12 @@ def build_prompt(
     failures: list[Any],
     calls_remaining: int,
     seconds_remaining: float,
+    mode: str = "repair",
 ) -> str:
     """Render runtime context without interpreting JSON braces or $symbols."""
+    template = INVESTIGATION_PROMPT if mode == "investigation" else SYSTEM_PROMPT
     return (
-        SYSTEM_PROMPT
+        template
         .replace("<<SYSTEM_VERSION>>", str(context.system_version))
         .replace("<<CHECKS>>", json.dumps(context.checks, ensure_ascii=False, default=str))
         .replace("<<PREVIOUS_SUMMARY>>", context.previous_summary or "无")
@@ -293,6 +363,7 @@ def parse_plan(
     facts: dict[str, Any] | None = None,
     *,
     max_steps: int = 15,
+    mode: str = "repair",
 ) -> ParsedPlan:
     """Parse, security-scan, validate and convert model JSON to executor Steps."""
     if not isinstance(raw, str) or not raw.strip():
@@ -344,6 +415,21 @@ def parse_plan(
         raise PlannerError("plan expanded to no executable steps")
     if len(steps) > max_steps:
         raise PlannerError(f"expanded plan exceeds {max_steps} steps")
+
+    if mode == "investigation":
+        names = {step.tool for step in steps}
+        illegal = names - INVESTIGATION_TOOLS
+        if illegal:
+            raise PlannerError(
+                "investigation stage may only use read-only tools; rejected: " + ", ".join(sorted(illegal))
+            )
+        return ParsedPlan(
+            diagnosis=payload["diagnosis"].strip(),
+            steps=steps,
+            expect=payload["expect"].strip(),
+            if_fail=payload["if_fail"].strip(),
+        )
+
     _validate_order(steps, facts or {})
 
     checks = getattr(context, "checks", [])
@@ -361,13 +447,17 @@ def parse_plan(
     if missing:
         raise PlannerError(f"plan does not address failed checks: {sorted(missing)}")
     if {"catalog", "search", "export", "backlog"}.issubset(failed):
-        if "read_manual" not in names or (not (facts or {}).get("manuals") and "list_manuals" not in names):
+        # 两阶段架构下，手册可能在调查阶段已读过（facts.manual_content 存在），
+        # 此时修复阶段无需重复读取，直接视为已满足资料要求。
+        manual_already_read = bool((facts or {}).get("manual_content"))
+        if "read_manual" not in names and not manual_already_read:
             raise PlannerError("all-failed plan must read an applicable recovery manual using observed manuals")
-        read_at = next(i for i, step in enumerate(steps) if step.tool == "read_manual")
-        list_at = next((i for i, step in enumerate(steps) if step.tool == "list_manuals"), -1)
-        writes = {"restore_catalog", "rebuild_index", "update_settings", "reload_worker", "retry_job"}
-        if list_at > read_at or any(step.tool in writes for step in steps[:read_at]):
-            raise PlannerError("manual investigation must precede repair operations")
+        if "read_manual" in names:
+            read_at = next(i for i, step in enumerate(steps) if step.tool == "read_manual")
+            list_at = next((i for i, step in enumerate(steps) if step.tool == "list_manuals"), -1)
+            writes = {"restore_catalog", "rebuild_index", "update_settings", "reload_worker", "retry_job"}
+            if list_at > read_at or any(step.tool in writes for step in steps[:read_at]):
+                raise PlannerError("manual investigation must precede repair operations")
     if failed == {"backlog"}:
         allowed = {"read_resource", "retry_job", "run_self_check"}
         if names - allowed or not any(step.tool == "run_self_check" for step in steps):

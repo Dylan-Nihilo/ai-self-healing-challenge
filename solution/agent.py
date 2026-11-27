@@ -217,7 +217,8 @@ def collect_facts(context: RepairContext, tools: Any, report: ExecutionReport, d
     """Collect candidates; the model, not this collector, selects repair resources."""
     failed = set(_failed_checks(context.checks))
     facts = report.facts
-    if "catalog" in failed:
+    # search 失败时模型也可能需要核对快照（判断是否要恢复目录），因此一并采集候选。
+    if "catalog" in failed or "search" in failed:
         facts["snapshots"] = _call(tools, report, "list_snapshots", {}, deadline)["snapshots"]
         details = []
         for candidate in facts["snapshots"]:
@@ -237,6 +238,79 @@ def collect_facts(context: RepairContext, tools: Any, report: ExecutionReport, d
         jobs = _call(tools, report, "read_resource", {"resource": "jobs"}, deadline)["jobs"]
         facts["jobs"] = [{"id": j["id"], "state": j["state"]} for j in jobs]
         facts["job_ids"] = [j["id"] for j in jobs if j["state"] != "done"]
+
+
+def _collect_investigation_results(report: ExecutionReport) -> None:
+    """把调查阶段真实读到的资料回灌到 facts，供修复阶段作为决策依据。"""
+    manual_content: dict[str, str] = {}
+    snapshot_content: dict[str, Any] = {}
+    for evidence in report.evidence:
+        if not evidence.ok:
+            continue
+        if evidence.tool == "read_manual" and isinstance(evidence.data, dict):
+            document_id = evidence.args.get("document_id")
+            text = evidence.data.get("text")
+            if isinstance(document_id, str) and isinstance(text, str) and text.strip():
+                manual_content[document_id] = text[:4000]
+        elif evidence.tool == "read_snapshot" and isinstance(evidence.data, dict):
+            snapshot_id = evidence.data.get("id") or evidence.args.get("snapshot_id")
+            text = evidence.data.get("text")
+            if isinstance(snapshot_id, str) and isinstance(text, str):
+                try:
+                    document = json.loads(text)
+                except ValueError:
+                    continue
+                documents = document.get("documents")
+                snapshot_content[snapshot_id] = {
+                    "version": evidence.data.get("version"),
+                    "schema_version": document.get("schema_version"),
+                    "documents": len(documents) if isinstance(documents, list) else 0,
+                }
+    if manual_content:
+        report.facts["manual_content"] = manual_content
+    if snapshot_content:
+        report.facts["snapshot_content"] = snapshot_content
+
+
+def _investigate(context: RepairContext, tools: Any, report: ExecutionReport,
+                 deadline: float, notes: list[str]) -> tuple[str, ExecutionReport]:
+    """阶段一：模型只规划调查动作，执行后把真实资料回灌到 facts。
+
+    这是修复阶段能否「基于资料决策」的前提 —— 没有这一阶段，读手册的返回拿不到，
+    修复计划就只能来自 prompt 里的先验知识。
+    """
+    from solution import providers
+    from solution.planner import PlannerError, build_prompt, parse_plan
+
+    seconds = deadline - time.monotonic()
+    if seconds < 45:
+        notes.append("时间不足以完成调查阶段，直接进入修复")
+        return "", report
+
+    used = getattr(tools, "used", 0)
+    prompt = build_prompt(context, report.facts, [asdict(f) for f in report.failures],
+                          max(1, MAX_TOOL_CALLS - used - 12), seconds,
+                          mode="investigation")
+    try:
+        raw = providers.chat([
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "只规划调查动作，不要修复。输出 JSON。"},
+        ], timeout=25.0)
+        parsed = parse_plan(raw, context, report.facts, max_steps=6, mode="investigation")
+    except (providers.ProviderError, PlannerError) as exc:
+        notes.append("调查阶段跳过：" + _safe_error(exc))
+        return "", report
+
+    before_failures = list(report.failures)
+    updated = execute(parsed.steps, tools, deadline=deadline,
+                      budget=max(1, MAX_TOOL_CALLS - 10),
+                      initial_facts=report.facts, initial_evidence=report.evidence,
+                      initial_calls=used)
+    updated.failures = before_failures + updated.failures
+    _collect_investigation_results(updated)
+    collected = sorted(updated.facts.get("manual_content", {}))
+    notes.append("调查阶段 %d 步，读到资料：%s" % (len(parsed.steps), ",".join(collected) or "无"))
+    return parsed.diagnosis, updated
 
 
 def _safe_error(exc: Exception) -> str:
@@ -279,9 +353,15 @@ def repair(context: RepairContext, tools: ToolClient) -> RepairResult:
     diagnosis = ""
     notes: list[str] = []
     exhausted_replan = False
+    planning_errors: list[dict[str, Any]] = []
     attempt = 0
     try:
         collect_facts(context, bounded, report, deadline)
+        # 阶段一：调查。模型只规划读取动作，执行后把真实资料（手册原文、快照摘要）
+        # 回灌进 facts，修复阶段才能基于资料而不是先验知识做决策。
+        investigation_diagnosis, report = _investigate(context, bounded, report, deadline, notes)
+        if investigation_diagnosis:
+            diagnosis = investigation_diagnosis
         for attempt in range(2):
             seconds = deadline - time.monotonic()
             if seconds < 45:
@@ -289,13 +369,23 @@ def repair(context: RepairContext, tools: ToolClient) -> RepairResult:
                 break
             # Exactly the same facts object is rendered and passed to the parser.
             facts = report.facts
-            prompt = build_prompt(context, facts, [asdict(f) for f in report.failures],
+            prompt = build_prompt(context, facts,
+                                  [asdict(f) for f in report.failures] + planning_errors,
                                   MAX_TOOL_CALLS - bounded.used - 1, seconds)
             raw = providers.chat([
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": "根据真实事实选择最小修复计划，只输出 JSON。"},
             ], timeout=25.0)
-            parsed = parse_plan(raw, context, facts, max_steps=min(15, MAX_TOOL_CALLS - bounded.used - 1))
+            try:
+                parsed = parse_plan(raw, context, facts, max_steps=min(15, MAX_TOOL_CALLS - bounded.used - 1))
+            except PlannerError as exc:
+                # 计划校验失败不是终点：把具体规则冲突回灌给模型，让它自己改正一次。
+                message = str(exc)[:240]
+                planning_errors.append({"tool": "<plan_check>", "code": "plan_rejected", "message": message})
+                notes.append("计划被拒，回灌重规划：" + message[:120])
+                if attempt == 1:
+                    raise
+                continue
             diagnosis = parsed.diagnosis
             previous_failures = list(report.failures)
             # Agent owns final verification, so it can wait for queued retries first.
