@@ -273,7 +273,7 @@ def _collect_investigation_results(report: ExecutionReport) -> None:
 
 
 def _investigate(context: RepairContext, tools: Any, report: ExecutionReport,
-                 deadline: float, notes: list[str]) -> tuple[str, ExecutionReport]:
+                 deadline: float, notes: list[str]) -> tuple[str, ExecutionReport, str]:
     """阶段一：模型只规划调查动作，执行后把真实资料回灌到 facts。
 
     这是修复阶段能否「基于资料决策」的前提 —— 没有这一阶段，读手册的返回拿不到，
@@ -285,7 +285,7 @@ def _investigate(context: RepairContext, tools: Any, report: ExecutionReport,
     seconds = deadline - time.monotonic()
     if seconds < 45:
         notes.append("时间不足以完成调查阶段，直接进入修复")
-        return "", report
+        return "", report, ""
 
     used = getattr(tools, "used", 0)
     prompt = build_prompt(context, report.facts, [asdict(f) for f in report.failures],
@@ -299,7 +299,7 @@ def _investigate(context: RepairContext, tools: Any, report: ExecutionReport,
         parsed = parse_plan(raw, context, report.facts, max_steps=6, mode="investigation")
     except (providers.ProviderError, PlannerError) as exc:
         notes.append("调查阶段跳过：" + _safe_error(exc))
-        return "", report
+        return "", report, ""
 
     before_failures = list(report.failures)
     updated = execute(parsed.steps, tools, deadline=deadline,
@@ -309,8 +309,11 @@ def _investigate(context: RepairContext, tools: Any, report: ExecutionReport,
     updated.failures = before_failures + updated.failures
     _collect_investigation_results(updated)
     collected = sorted(updated.facts.get("manual_content", {}))
-    notes.append("调查阶段 %d 步，读到资料：%s" % (len(parsed.steps), ",".join(collected) or "无"))
-    return parsed.diagnosis, updated
+    note = "%d 步读取" % len(parsed.steps)
+    note += ("，资料：" + ",".join(collected)) if collected else "，未取得资料"
+    if updated.facts.get("snapshot_content"):
+        note += "；核对快照 %d 份" % len(updated.facts["snapshot_content"])
+    return parsed.diagnosis, updated, note
 
 
 def _safe_error(exc: Exception) -> str:
@@ -354,12 +357,13 @@ def repair(context: RepairContext, tools: ToolClient) -> RepairResult:
     notes: list[str] = []
     exhausted_replan = False
     planning_errors: list[dict[str, Any]] = []
+    investigation_note = ""
     attempt = 0
     try:
         collect_facts(context, bounded, report, deadline)
         # 阶段一：调查。模型只规划读取动作，执行后把真实资料（手册原文、快照摘要）
         # 回灌进 facts，修复阶段才能基于资料而不是先验知识做决策。
-        investigation_diagnosis, report = _investigate(context, bounded, report, deadline, notes)
+        investigation_diagnosis, report, investigation_note = _investigate(context, bounded, report, deadline, notes)
         if investigation_diagnosis:
             diagnosis = investigation_diagnosis
         for attempt in range(2):
@@ -426,5 +430,6 @@ def repair(context: RepairContext, tools: ToolClient) -> RepairResult:
     complete = verified and len(checks) == 4 and all(c.get("ok") is True for c in checks)
     progress = any(e.ok and e.tool in {"restore_catalog", "rebuild_index", "update_settings", "reload_worker", "retry_job"} for e in report.evidence)
     report.calls_used = bounded.used
-    summary = ("[模型判断] " + (diagnosis or "规划未完成") + " | " + _summary(context.checks, checks, report, notes))[:1200]
+    prefix = ("[调查] " + investigation_note + " | ") if investigation_note else ""
+    summary = (prefix + "[修复判断] " + (diagnosis or "规划未完成") + " | " + _summary(context.checks, checks, report, notes))[:1200]
     return RepairResult(summary=summary, outcome="changed" if complete or (progress and not exhausted_replan) else "blocked")
