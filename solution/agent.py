@@ -214,30 +214,35 @@ class _RoundTools:
 
 
 def collect_facts(context: RepairContext, tools: Any, report: ExecutionReport, deadline: float) -> None:
-    """Collect candidates; the model, not this collector, selects repair resources."""
-    failed = set(_failed_checks(context.checks))
+    """无条件采集全部候选，由模型选择用哪些。
+
+    早期版本按「本轮失败的检查项」决定采集范围以节省调用，但 context.checks 是
+    本轮开始时的快照，执行期间故障可能变化，导致 facts 缺少模型需要的关键资料
+    （例如 backlog 单独失败时没有 manuals，调查阶段会被校验直接拒绝）。
+    候选信息的完整性优先于节省数次调用。
+    """
     facts = report.facts
-    # search 失败时模型也可能需要核对快照（判断是否要恢复目录），因此一并采集候选。
-    if "catalog" in failed or "search" in failed:
-        facts["snapshots"] = _call(tools, report, "list_snapshots", {}, deadline)["snapshots"]
-        details = []
-        for candidate in facts["snapshots"]:
-            data = _call(tools, report, "read_snapshot", {"snapshot_id": candidate["id"]}, deadline)
-            content = json.loads(data["text"])
-            documents = content.get("documents", [])
-            details.append({"id": candidate["id"], "version": candidate.get("version"),
-                            "schema_version": content.get("schema_version"),
-                            "documents": len(documents) if isinstance(documents, list) else 0})
-        facts["snapshot_details"] = details
-        facts["manuals"] = _call(tools, report, "list_manuals", {}, deadline)["manuals"]
-    if "export" in failed:
-        facts["storage_directories"] = _call(tools, report, "inspect_storage", {}, deadline)["directories"]
-        facts["settings"] = _call(tools, report, "read_resource", {"resource": "settings"}, deadline)
-        facts["revision"] = facts["settings"]["revision"]
-    if "backlog" in failed:
-        jobs = _call(tools, report, "read_resource", {"resource": "jobs"}, deadline)["jobs"]
-        facts["jobs"] = [{"id": j["id"], "state": j["state"]} for j in jobs]
-        facts["job_ids"] = [j["id"] for j in jobs if j["state"] != "done"]
+
+    facts["manuals"] = _call(tools, report, "list_manuals", {}, deadline)["manuals"]
+
+    facts["snapshots"] = _call(tools, report, "list_snapshots", {}, deadline)["snapshots"]
+    details = []
+    for candidate in facts["snapshots"]:
+        data = _call(tools, report, "read_snapshot", {"snapshot_id": candidate["id"]}, deadline)
+        content = json.loads(data["text"])
+        documents = content.get("documents", [])
+        details.append({"id": candidate["id"], "version": candidate.get("version"),
+                        "schema_version": content.get("schema_version"),
+                        "documents": len(documents) if isinstance(documents, list) else 0})
+    facts["snapshot_details"] = details
+
+    facts["storage_directories"] = _call(tools, report, "inspect_storage", {}, deadline)["directories"]
+    facts["settings"] = _call(tools, report, "read_resource", {"resource": "settings"}, deadline)
+    facts["revision"] = facts["settings"]["revision"]
+
+    jobs = _call(tools, report, "read_resource", {"resource": "jobs"}, deadline)["jobs"]
+    facts["jobs"] = [{"id": j["id"], "state": j["state"]} for j in jobs]
+    facts["job_ids"] = [j["id"] for j in jobs if j["state"] != "done"]
 
 
 def _collect_investigation_results(report: ExecutionReport) -> None:
