@@ -1,1 +1,2 @@
 # Add dependencies for your repair agent here.
+openai
