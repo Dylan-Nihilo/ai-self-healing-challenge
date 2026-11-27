@@ -56,11 +56,18 @@ docker compose up -d --build --wait
 
 ### 再次恢复
 
-页面点击「触发一次故障」，或在 PowerShell 注入明确的 worker 故障：
+页面点击「触发一次故障」，或者在 PowerShell 中注入指定类型：
 
 ```powershell
-curl.exe -X POST -H "X-Workbench-Token: local-preview" -H "Content-Type: application/json" http://127.0.0.1:8032/api/drill -d '{"kind":"worker"}'
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8032/api/drill' `
+  -Headers @{'X-Workbench-Token'='local-preview'} `
+  -ContentType 'application/json' -Body '{"kind":"worker"}'
 ```
+
+`kind` 可取 `catalog` / `search` / `worker` / `mixed` / `random`。
+
+> 不要写成 `curl.exe ... -d '{"kind":"worker"}'`：PowerShell 会剥掉单引号内 JSON 的双引号，
+> 服务端收到非法 JSON 并返回 422。若必须用 curl，需转义为 `-d "{\"kind\":\"worker\"}"`。
 
 观察恢复过程与最终四项全绿；worker 单点故障下，模型只修归档配置并重试任务，events 不含 `restore_catalog` / `rebuild_index`。原有任务被保留，可下载归档 ZIP 核对文档。
 

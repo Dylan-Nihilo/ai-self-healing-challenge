@@ -203,3 +203,54 @@ elif step.tool == "rebuild_index":
 
 这也是本项目里唯一一次由外部评审发现、并通过实验证伪、再重构验证的缺陷，其价值不在于修好了，而在于**建立了一种能判定「AI 是否真的在用资料」的方法**。
 
+## 8. collect_facts 的过度优化：facts 不完整导致的 blocked
+
+### 现象
+
+收尾阶段候选人在页面上自测时，出现 3 / 4 通过（仅全文检索失败），右侧显示「等待补充处理」，即 `blocked`。该轮 summary 保留了失败经过：
+
+```
+Initially failed=backlog
+Issues=调查阶段跳过：planner_validation: document_id must be observed in this run's manuals;
+计划被拒，回灌重规划：plan does not address failed checks: ['backlog'];
+计划被拒，回灌重规划：plan expanded to no executable steps
+```
+
+注意 `Initially failed=backlog` 而最终失败的是 `search` —— 这一轮开始时失败的项，和它实际需要处理的问题并不一致。
+
+### 根因
+
+`collect_facts` 为节省调用，按「本轮失败的检查项」决定采集范围：
+
+- `catalog`/`search` 失败 → 采 snapshots 与 manuals
+- `export` 失败 → 采 storage 与 settings
+- `backlog` 失败 → 采 jobs
+
+但 `context.checks` 是本轮开始时的快照。这一轮开始时只有 `backlog` 失败，于是只采了 jobs，`facts` 里没有 `manuals` 与 `snapshots`。
+
+结果是：调查阶段模型要求读手册时，planner 报 `document_id must be observed in this run's manuals` 并跳过调查；`facts` 不完整又使修复计划无法覆盖失败项，两次重规划都失败，最终返回 `blocked`。而执行期间实际恶化的 `search`，从未被这一轮处理。
+
+### 修复
+
+改为无条件采集全部候选：`manuals`、`snapshots` + `snapshot_details`、`storage_directories`、`settings`、`jobs`。
+
+代价是固定约 7 次调用，换 `facts` 的完整性。实测该场景的总调用数由 20 次**降到 14 次** —— 因为 `facts` 一次采全后，调查阶段的模型发现资料已齐，不再重复读取。为了省 3 次调用而牺牲完整性，结果反而多花 6 次。
+
+### 验证
+
+- `search` 单点：14 次调用、四项全绿，模型判断「catalog 已通过，仅索引损坏，无需恢复目录」，只执行 `rebuild_index`
+- `catalog` / `worker` / `mixed` 单点：全部自主恢复，summary 均以 `[调查]` 段开头
+- `search` 单点场景下工具序列中不含 `restore_catalog`，未触碰健康的组件
+
+### 第三个同类缺陷
+
+第 6 节（executor 校验）、第 7 节（手册因果性）、本节（facts 采集）三次缺陷有共同特征：**都只在某种「组合」下才出现，而验证总是从单一稳态出发，走不到那个组合**。
+
+- 第 6 节：只在「仅有 search 损坏」时触发
+- 第 7 节：只在「审查者质疑决策来源」时才被意识到
+- 本节：只在「本轮起始失败项与实际故障不一致」时触发
+
+三次都是靠**实际运行**发现的，没有一次是读代码想出来的。这也说明：这个任务的难点不在写出能跑的代码，而在于穷举那些「看起来不会发生」的状态组合。
+
+本章记录到此为止。截至最后一次提交，四类故障单点与 mixed 组合均可自主恢复，无降级。
+
