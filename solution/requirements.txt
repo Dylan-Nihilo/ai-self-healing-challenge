@@ -1,1 +1,2 @@
-# Add dependencies for your repair agent here.
+# The repair agent uses only Python's standard library and packages already
+# installed by the fixed runner image. No additional dependency is required.
